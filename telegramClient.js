@@ -4,10 +4,48 @@ const { StringSession } = require('telegram/sessions');
 const { Api } = require('telegram/tl');
 const { prompt } = require('prompts');
 const fs = require('fs');
+const config = require('./config.json');
 
+const apiId = config.API_ID;
+const apiHash = config.API_HASH;
+
+// telegram client
 let client;
-let stringSession = new StringSession(''); // 可以儲存資訊 ex: 登入資訊，就不用重複登入驗證
+// telegram傳送訊息的聊天室對象
+let targetEntity;
+
 const wsServer = new WebSocket.Server({ port: 8086 });
+
+wsServer.on('connection', (ws) => {
+  console.log('websocket client connected');
+
+  // 每 30 秒發送一次自訂 ping 訊息
+  const heartbeatInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "ping" }));
+      console.log('Sent ping to client');
+    }
+  }, 30000);
+
+  ws.on('message', (message) => {
+    console.log('Received message:', message);
+  });
+
+  ws.on('close', () => {
+    clearInterval(heartbeatInterval);
+    console.log('Client disconnected');
+  });
+});
+
+// 讀取 session.txt（如果存在）
+let sessionString = '';
+if (fs.existsSync('session.txt')) {
+  sessionString = fs.readFileSync('session.txt', 'utf-8').trim();
+}
+console.log('session value', sessionString);
+
+// 可以儲存資訊 ex: 登入資訊，就不用重複登入驗證
+let stringSession = new StringSession(sessionString);
 
 // 創建或打開日誌文件
 // const logStream = fs.createWriteStream('./log/app.log', { flags: 'a' });
@@ -18,78 +56,81 @@ const wsServer = new WebSocket.Server({ port: 8086 });
 // process.stderr.write = errorStream.write.bind(errorStream);
 
 async function authenticate() {
-  const credentials = await prompt([
-    {
-      type: 'number',
-      name: 'apiId',
-      message: 'Enter your Telegram API ID:',
-    },
-    {
-      type: 'text',
-      name: 'apiHash',
-      message: 'Enter your Telegram API Hash:',
-    },
-  ]);
-
-  const apiId = credentials.apiId;
-  const apiHash = credentials.apiHash;
-
   // 創建 Telegram 客戶端
   client = new TelegramClient(stringSession, apiId, apiHash, {
     connectionRetries: 5,
   });
 
-  await client.start({
-    phoneNumber: async () => {
-      const response = await prompt({
-        type: 'text',
-        name: 'phoneNumber',
-        message: 'Enter your phone number:',
+  (async () => {
+    if (sessionString.trim() === '') {
+      // 需要登入流程
+      await client.start({
+        phoneNumber: async () => {
+          const response = await prompt({
+            type: 'text',
+            name: 'phoneNumber',
+            message: 'Enter your phone number:',
+          });
+          return response.phoneNumber;
+        },
+        phoneCode: async () => {
+          const response = await prompt({
+            type: 'text',
+            name: 'phoneCode',
+            message: 'Enter the code you received:',
+          });
+          return response.phoneCode;
+        },
+        password: async () => {
+          const response = await prompt({
+            type: 'text',
+            name: 'password',
+            message: 'Enter your 2FA password (if applicable):',
+          });
+          return response.password;
+        },
+        onError: (err) => console.log(err),
       });
-      return response.phoneNumber;
-    },
-    phoneCode: async () => {
-      const response = await prompt({
-        type: 'text',
-        name: 'phoneCode',
-        message: 'Enter the code you received:',
-      });
-      return response.phoneCode;
-    },
-    password: async () => {
-      const response = await prompt({
-        type: 'text',
-        name: 'password',
-        message: 'Enter your 2FA password (if applicable):',
-      });
-      return response.password;
-    },
-    onError: (err) => console.log(err),
-  });
-
-  console.log('Logged in successfully!');
-  fs.writeFileSync('session.txt', client.session.save());
+      
+      // 登入成功，保存 session
+      fs.writeFileSync('session.txt', client.session.save(), 'utf-8');
+      console.log('登入成功，session 已保存');
+    } else {
+      // 已有 session，直接連線
+      await client.connect();
+      console.log('使用已有 session 連線');
+    }
+  })();
 }
 
 async function sendMessage (info) {
   try {
-    // 发送消息
-    await client.sendMessage(info.uuid, { message: info.message });
-    console.log(`${info.uuid}'s message sent successfully! : ${info.message}`);
+    const messageInfo = info.message.trim();
+
+    // 發送消息
+    if(targetEntity) {
+      await client.sendMessage(targetEntity, { message: messageInfo });
+      console.log(`${info.uuid}'s message sent successfully! : ${messageInfo}`);
+    }else{
+      console.error(`${info.uuid} failed to send message: chat room not found`);
+    }
+
+    return `${info.uuid}'s message sent successfully! : ${messageInfo}`;
   } catch (error) {
     console.error(`${info.uuid} failed to send message: ${error}`);
+    return `${info.uuid} failed to send message: ${error}`
   }
 }
 
 async function createGroup (group) {
-  // const users = [
-  //   // await client.getEntity('user1_username'),  // user_id 或 username
-  //   // await client.getEntity('user2_username')
-  // ];
-
   const groups = await getAllGroup();
-  const uuidExist = groups.find(element => element.title === group?.uuid)
-  if (uuidExist) return {}
+  const entity = groups.find(element => element.title === group?.uuid)
+
+  // 群組已經存在
+  if (entity) {
+    targetEntity = entity
+    return {}
+  }
   
   // 建立群組
   const newChat = await client.invoke(
@@ -98,6 +139,10 @@ async function createGroup (group) {
           title: group?.uuid
       })
   );
+
+  // 新群組
+  const newEntity = await client.getEntity(newChat?.updates?.chats[0])
+  targetEntity = newEntity
 
   console.log('New group created:', newChat);
   return newChat
